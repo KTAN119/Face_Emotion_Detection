@@ -1,14 +1,12 @@
 import argparse
+import os
+
+import cv2
+import torch
+import torch.nn as nn
 from PIL import Image
 from pytorchcv.model_provider import get_model
 from torchvision import transforms
-import torchvision
-from torch.utils.data import random_split, DataLoader, Dataset
-import torch.nn as nn
-import torch
-import numpy as np
-import os
-import cv2
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--file_type", type=str, default=None,
@@ -56,22 +54,23 @@ test_transform = transforms.Compose([
 
 
 def preprocess(image):
-    image = Image.fromarray(image).convert(
-        'RGB')  # Webcam frames are numpy array format
+    image = Image.fromarray(image).convert('RGB')  # Webcam frames are numpy array format
     # Therefore transform back to PIL image
     image = test_transform(image)
     image = image.float()
     #image = Variable(image, requires_autograd=True)
-    image = image.cuda()
-    # I don"t know for sure but Resnet-50 model seems to only
+    if torch.cuda.is_available():
+        image = image.cuda()
     image = image.unsqueeze(0)
-    # accpets 4-D Vector Tensor so we need to squeeze another
     return image
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = CNNModel().to(device)
-state_dict = torch.load(opt.weight)
+if torch.cuda.is_available():
+    state_dict = torch.load(opt.weight)
+else:
+    state_dict = torch.load(opt.weight, map_location=device)
 model.load_state_dict(state_dict)
 
 emotions = ["Angry", "Disgust", "Fear", "Happy", "Neutral", "Sad", "Surprise"]
@@ -167,7 +166,7 @@ elif opt.file_type == 'image':
     img_item = os.path.join(opt.output_image_file, "output_img.jpg")
     cv2.imwrite(img_item, frame)
 
-elif file_type == 'real-time':
+elif opt.file_type == 'real-time':
     cap = cv2.VideoCapture(0)
 
     while True:
