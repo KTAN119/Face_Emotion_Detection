@@ -2,6 +2,7 @@ import argparse
 import os
 
 import cv2
+import ffmpeg
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -9,20 +10,24 @@ from pytorchcv.model_provider import get_model
 from torchvision import transforms
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--file_type", type=str, default=None,
-                    help="image/video/real-time")
-parser.add_argument("--video_file", type=str, default='/home/students/acct2014_04/DIP/input_video',
+parser.add_argument("--input_type", type=str, default="real-time",
+                    choices=["image", "video", "real-time"],
+                    help="type of input")
+parser.add_argument("--video_file", type=str, default="input/face_video.mp4",
                     help="input video file path")
-parser.add_argument("--img_file", type=str, default='/home/students/acct2014_04/DIP/input_image',
+parser.add_argument("--img_file", type=str, default="input/face_image.jpg",
                     help="input image file path")
-parser.add_argument("--output_video_file", type=str, default='/home/students/acct2014_04/DIP/output_video',
+parser.add_argument("--output_video_directory", type=str, default="output_video",
                     help="output video file path")
-parser.add_argument("--output_image_file", type=str, default='/home/students/acct2014_04/DIP/output_image',
+parser.add_argument("--output_image_directory", type=str, default="output_image",
                     help="output image file path")
-parser.add_argument("--weight", type=str, default='/home/students/acct2014_04/DIP/CNN_Weight_Original_Clear_Resnet101/weights_epoch_29_acc_0.6388966285873502.pth',
-                    help="resnet101 weight path")
-parser.add_argument("--cascade_file", type=str, default='/home/students/acct2014_04/DIP/haarcascade_frontalface_alt2.xml',
+parser.add_argument("--weight", type=str, default="weights/vgg19.pth",
+                    help="classifier model weight file path")
+parser.add_argument("--cascade_file", type=str, default="haarcascade_frontalface_alt2.xml",
                     help="haar cascade file path")
+parser.add_argument("--classifier", type=str, default="vgg19",
+                    choices=["vgg19", "resnet101"],
+                    help="classifier type")
 opt = parser.parse_args()
 print(opt)
 
@@ -31,7 +36,7 @@ class CNNModel(nn.Module):
     def __init__(self):
         super(CNNModel, self).__init__()
         # Load pretrained network as backbone
-        pretrained = get_model('resnet101', pretrained=True)
+        pretrained = get_model(opt.classifier, pretrained=True)
         self.backbone = pretrained.features
         self.output = pretrained.output
         self.classifier = nn.Linear(1000, 7)
@@ -54,8 +59,9 @@ test_transform = transforms.Compose([
 
 
 def preprocess(image):
-    image = Image.fromarray(image).convert('RGB')  # Webcam frames are numpy array format
+    # Webcam frames are numpy array format
     # Therefore transform back to PIL image
+    image = Image.fromarray(image).convert("RGB")
     image = test_transform(image)
     image = image.float()
     #image = Variable(image, requires_autograd=True)
@@ -65,7 +71,50 @@ def preprocess(image):
     return image
 
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def check_rotation(video_file):
+    """Checks if given video file has rotation metadata
+
+    Used as workaround for OpenCV bug 
+    https://github.com/opencv/opencv/issues/15499, where the rotation metadata 
+    in a video is not used by cv2.VideoCapture. May have to be removed/tweaked 
+    when bug is fixed in a new opencv-python release.
+
+    Parameters
+    ----------
+    video_file : str
+        Path to video file to be checked
+
+    Returns
+    -------
+    rotate_code : enum or None
+        Flag fror cv2.rotate to decide how much to rotate the image. 
+        None if no rotation is required
+    """
+    try:
+        meta_dict = ffmpeg.probe(video_file)
+    except ffmpeg.Error as e:
+        print("stdout:", e.stdout.decode("utf8"))
+        print("stderr:", e.stderr.decode("utf8"))
+        return None
+
+    try:
+        rotation_angle = int(meta_dict["streams"][0]["tags"]["rotate"])
+    except KeyError as e:
+        print("KeyError:", e)
+        rotation_angle = None
+
+    rotate_code = None
+    if rotation_angle == 90:
+        rotate_code = cv2.ROTATE_90_CLOCKWISE
+    elif rotation_angle == 180:
+        rotate_code = cv2.ROTATE_180
+    elif rotation_angle == 270:
+        rotate_code = cv2.ROTATE_90_COUNTERCLOCKWISE
+
+    return rotate_code
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = CNNModel().to(device)
 if torch.cuda.is_available():
     state_dict = torch.load(opt.weight)
@@ -77,65 +126,70 @@ emotions = ["Angry", "Disgust", "Fear", "Happy", "Neutral", "Sad", "Surprise"]
 
 face_cascade = cv2.CascadeClassifier(opt.cascade_file)
 
-if opt.file_type == 'video':
-    os.makedirs(opt.output_video_file, exist_ok=True)
-    counter = 0
+if opt.input_type == "video":
+    frames_path = os.path.join(opt.output_video_directory, "output_frames")
+    os.makedirs(frames_path, exist_ok=True)
     cap = cv2.VideoCapture(opt.video_file)
-    _, frame = cap.read()
-    if frame is not None:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(
-            gray, scaleFactor=1.5, minNeighbors=5)
-        for(x, y, w, h) in faces:
-            #            print(x, y, w, h)
-            roi_gray = gray[y:y+h, x:x+w]
-            roi_color = frame[y:y+h, x:x+w]
+    rotate_code = check_rotation(opt.video_file)
 
-            img = preprocess(roi_gray).to(device)
-            with torch.no_grad():
-                logits = model(img)
-                prediction = torch.argmax(logits, dim=1)
+    counter = 0
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if ret:
+            if rotate_code is not None:  # Rotate frame if necessary
+                frame = cv2.rotate(frame, rotate_code)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(
+                gray, scaleFactor=1.5, minNeighbors=5)
+            for(x, y, w, h) in faces:
+                roi_gray = gray[y:y+h, x:x+w]
+                roi_color = frame[y:y+h, x:x+w]
 
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            emotion = emotions[prediction]
-            color = (255, 0, 0)
-            stroke = 2
-            cv2.putText(frame, emotion, (x, y), font,
-                        1, color, stroke, cv2.LINE_AA)
+                img = preprocess(roi_gray).to(device)
+                with torch.no_grad():
+                    logits = model(img)
+                    prediction = torch.argmax(logits, dim=1)
 
-            end_cord_x = x+w
-            end_cord_y = y+h
-            cv2.rectangle(frame, (x, y), (end_cord_x,
-                                          end_cord_y), color, stroke)
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                emotion = emotions[prediction]
+                color = (255, 0, 0)
+                stroke = 2
+                cv2.putText(frame, emotion, (x, y), font,
+                            1, color, stroke, cv2.LINE_AA)
 
-        img_item = os.path.join(opt.output_video_file, f"{counter}.png")
-        cv2.imwrite(img_item, frame)
-        # cv2.imshow("frame", frame)
-        # if cv2.waitKey(20) & 0xFF == ord("q"):
-        #     break
+                end_cord_x = x+w
+                end_cord_y = y+h
+                cv2.rectangle(frame, (x, y), (end_cord_x,
+                                              end_cord_y), color, stroke)
 
-        counter += 1
-    cap.release()
-    cv2.destroyAllWindows()
+            img_item = os.path.join(frames_path, f"{counter}.png")
+            cv2.imwrite(img_item, frame)
+
+            counter += 1
+
+        else:
+            cap.release()
+            cv2.destroyAllWindows()
+            break
 
     img_array = []
-    no_img = len(os.listdir(opt.output_video_file))
-    for counter in range(no_img):
-        filename = os.path.join(opt.output_video_file, f"{counter}.png")
+    size = set()
+    for i in range(counter):
+        filename = os.path.join(frames_path, f"{i}.png")
         img = cv2.imread(filename)
         height, width, layers = img.shape
         size = (width, height)
         img_array.append(img)
 
     out = cv2.VideoWriter(os.path.join(
-        opt.output_video_file, "output_vid.mp4"), cv2.VideoWriter_fourcc(*'MP4V'), 15, size)
+        opt.output_video_directory, "output_vid.mp4"), cv2.VideoWriter_fourcc(*"MP4V"), 30, size)
 
     for i in range(len(img_array)):
         out.write(img_array[i])
     out.release()
 
-elif opt.file_type == 'image':
-    os.makedirs(opt.output_image_file, exist_ok=True)
+elif opt.input_type == "image":
+    os.makedirs(opt.output_image_directory, exist_ok=True)
     frame = cv2.imread(opt.img_file)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     faces = face_cascade.detectMultiScale(
@@ -163,10 +217,10 @@ elif opt.file_type == 'image':
         end_cord_y = y+h
         cv2.rectangle(frame, (x, y), (end_cord_x, end_cord_y), color, stroke)
 
-    img_item = os.path.join(opt.output_image_file, "output_img.jpg")
+    img_item = os.path.join(opt.output_image_directory, "output_img.jpg")
     cv2.imwrite(img_item, frame)
 
-elif opt.file_type == 'real-time':
+elif opt.input_type == "real-time":
     cap = cv2.VideoCapture(0)
 
     while True:
@@ -175,7 +229,7 @@ elif opt.file_type == 'real-time':
         faces = face_cascade.detectMultiScale(
             gray, scaleFactor=1.5, minNeighbors=5)
         for(x, y, w, h) in faces:
-            print(x, y, w, h)
+            # print(x, y, w, h)
             roi_gray = gray[y:y+h, x:x+w]
             roi_color = frame[y:y+h, x:x+w]
 
@@ -196,8 +250,8 @@ elif opt.file_type == 'real-time':
             cv2.rectangle(frame, (x, y), (end_cord_x,
                                           end_cord_y), color, stroke)
 
-        cv2.imshow('frame', frame)
-        if cv2.waitKey(20) & 0xFF == ord('q'):
+        cv2.imshow("frame", frame)
+        if cv2.waitKey(20) & 0xFF == ord("q"):
             break
 
     cap.release()
